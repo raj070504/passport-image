@@ -135,5 +135,3 @@ def process_image(request: ImageRequest):
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-# Note: To run this, use the command: uvicorn filename:app --reload
