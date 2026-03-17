@@ -10,5 +10,6 @@ dependencies = [
     "numpy>=2.4.3",
     "opencv-python>=4.13.0.92",
     "pillow-heif>=1.3.0",
+    "python-multipart>=0.0.22",
     "uvicorn>=0.41.0",
 ]

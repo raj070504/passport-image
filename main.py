@@ -5,21 +5,30 @@ import os
 from io import BytesIO
 from PIL import Image
 import pillow_heif
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# --- App Initialization ---
 # Register HEIF opener for Apple formats
 pillow_heif.register_heif_opener()
 
-# --- Pydantic Models ---
+app = FastAPI(title="Passport Photo Generator API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Pydantic Models (Optional for local testing) ---
 class ImageRequest(BaseModel):
     filepath: str
 
-# --- App Initialization ---
-app = FastAPI(title="Passport Photo Generator API")
-
-# --- Core Logic ---
+# --- Helper Logic ---
 def load_image_from_path(filepath: str) -> np.ndarray:
     """Reads an image directly from the local file system path."""
     if not os.path.exists(filepath):
@@ -36,38 +45,43 @@ def load_image_from_path(filepath: str) -> np.ndarray:
             raise ValueError("Could not decode image. Check file format or corruption.")
         return image_matrix
 
-def generate_passport_photo(image_matrix):
+
+# --- Core Logic ---
+def remove_background(image_matrix: np.ndarray) -> np.ndarray:
+    """Isolates the subject and replaces the background with pure white."""
     mp_selfie = mp.solutions.selfie_segmentation
-    mp_face = mp.solutions.face_detection
-
-    with mp_selfie.SelfieSegmentation(model_selection=0) as selfie_seg, \
-         mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_det:
-
+    
+    with mp_selfie.SelfieSegmentation(model_selection=0) as selfie_seg:
         h, w, _ = image_matrix.shape
         image_rgb = cv2.cvtColor(image_matrix, cv2.COLOR_BGR2RGB)
 
-        # --- STEP 1: Mask Generation & Refinement ---
+        # Mask Generation
         seg_results = selfie_seg.process(image_rgb)
-        mask = seg_results.segmentation_mask  # Float mask 0.0 to 1.0
+        mask = seg_results.segmentation_mask
 
-        # A. ERODE: Shrink the mask to eliminate the background "halo"
+        # Erode and Blur for clean edges
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.erode(mask, kernel, iterations=2)
-
-        # B. BLUR: Soften the edges so they don't look artificial
         mask = cv2.GaussianBlur(mask, (3, 3), 0)
 
-        # C. ALPHA BLENDING: Smoothly merge subject with white background
+        # Alpha Blending
         mask_3d = np.stack((mask,) * 3, axis=-1).astype(np.float32)
         image_float = image_matrix.astype(np.float32)
         white_bg_float = np.ones((h, w, 3), dtype=np.float32) * 255.0
 
         no_bg_float = (image_float * mask_3d) + (white_bg_float * (1.0 - mask_3d))
-        no_bg_image = no_bg_float.astype(np.uint8)
+        return no_bg_float.astype(np.uint8)
 
-        # --- STEP 2: Face Detection ---
-        no_bg_rgb = cv2.cvtColor(no_bg_image, cv2.COLOR_BGR2RGB)
-        face_results = face_det.process(no_bg_rgb)
+
+def crop_to_passport(image_matrix: np.ndarray) -> np.ndarray:
+    """Detects a face, centers it, and crops/pads to passport dimensions."""
+    mp_face = mp.solutions.face_detection
+    
+    with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_det:
+        h, w, _ = image_matrix.shape
+        image_rgb = cv2.cvtColor(image_matrix, cv2.COLOR_BGR2RGB)
+        
+        face_results = face_det.process(image_rgb)
 
         if not face_results.detections:
             raise ValueError("No face detected in the image.")
@@ -78,7 +92,7 @@ def generate_passport_photo(image_matrix):
         fx, fy = int(bboxC.xmin * w), int(bboxC.ymin * h)
         fw, fh = int(bboxC.width * w), int(bboxC.height * h)
 
-        # --- STEP 3: Smart Padding & Centering ---
+        # Smart Padding & Centering
         target_h = int(fh * 2.2) 
         target_w = int(target_h * (35 / 45)) 
 
@@ -95,43 +109,64 @@ def generate_passport_photo(image_matrix):
         can_y1, can_x1 = max(0, -y1), max(0, -x1)
         can_y2, can_x2 = can_y1 + (img_y2 - img_y1), can_x1 + (img_x2 - img_x1)
 
-        passport_canvas[can_y1:can_y2, can_x1:can_x2] = no_bg_image[img_y1:img_y2, img_x1:img_x2]
+        passport_canvas[can_y1:can_y2, can_x1:can_x2] = image_matrix[img_y1:img_y2, img_x1:img_x2]
 
-        # --- STEP 4: Final Resize ---
+        # Final Resize
         final_image = cv2.resize(passport_canvas, (413, 531), interpolation=cv2.INTER_AREA)
 
         return final_image
 
-# --- API Endpoints ---
 
+# --- API Endpoints ---
 @app.get("/")
 def health_check():
     """Returns a welcome message to confirm the API is live."""
-    return {"message": "Welcome! The Passport Photo API is live and ready."}
+    return {"message": "Welcome! The Passport Photo API is live and ready. 2.0"}
+
+async def process_upload(file: UploadFile, processing_func):
+    """Helper function to read upload, convert to OpenCV, process, and stream back."""
+    contents = await file.read()
+    
+    # Use PIL to safely open and convert image formats (handles HEIC via pillow_heif)
+    pil_image = Image.open(BytesIO(contents)).convert("RGB")
+    image_matrix = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    # Run whichever pipeline function was passed in
+    final_matrix = processing_func(image_matrix)
+
+    success, encoded_image = cv2.imencode(".jpg", final_matrix)
+    if not success:
+        raise ValueError("Failed to encode image to JPEG format.")
+
+    return StreamingResponse(
+        BytesIO(encoded_image.tobytes()),
+        media_type="image/jpeg"
+    )
+
+@app.post("/remove-bg")
+async def api_remove_bg(file: UploadFile = File(...)):
+    """Accepts an uploaded image file, removes background, and streams back."""
+    try:
+        return await process_upload(file, remove_background)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/crop")
+async def api_crop(file: UploadFile = File(...)):
+    """Accepts an uploaded pre-processed image, detects face, crops, and streams back."""
+    try:
+        return await process_upload(file, crop_to_passport)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate")
-def process_image(request: ImageRequest):
-    """
-    Accepts a local file path, processes the image to create a passport photo, 
-    and streams the resulting image back to the client.
-    """
+async def api_generate_full(file: UploadFile = File(...)):
+    """Runs the full pipeline: background removal followed by face cropping."""
+    def full_pipeline(image_matrix):
+        no_bg = remove_background(image_matrix)
+        return crop_to_passport(no_bg)
+        
     try:
-        # 1. Load the image from the provided local path
-        image_matrix = load_image_from_path(request.filepath)
-        
-        # 2. Run the halo-killer/centering pipeline
-        final_matrix = generate_passport_photo(image_matrix)
-        
-        # 3. Encode the OpenCV matrix to JPEG format in memory
-        success, encoded_image = cv2.imencode(".jpg", final_matrix)
-        if not success:
-            raise ValueError("Failed to encode the processed image.")
-            
-        # 4. Stream the image back as a response
-        io_buf = BytesIO(encoded_image.tobytes())
-        return StreamingResponse(io_buf, media_type="image/jpeg")
-        
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        return await process_upload(file, full_pipeline)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
